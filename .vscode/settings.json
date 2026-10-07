@@ -1,0 +1,8 @@
+{
+	"editor.rulers": [
+		79
+  ],
+
+  "editor.guides.indentation": true,
+  "python-envs.pythonProjects": [],
+}
