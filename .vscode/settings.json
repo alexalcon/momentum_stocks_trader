@@ -4,5 +4,14 @@
   ],
 
   "editor.guides.indentation": true,
+  "workbench.colorCustomizations": {
+    // Colors for Option 2 (Indentation Guides)
+    "editorIndentGuide.background1": "#444444",       // Color of regular, inactive guides
+    "editorIndentGuide.activeBackground1": "#ffcc00", // Color of the guide for your active code block
+
+    // Optional: Colors for bracket pair guides if you use them
+    // "editorBracketPairGuide.background1": "#555555",
+    // "editorBracketPairGuide.activeBackground1": "#00ffcc"
+  },
   "python-envs.pythonProjects": [],
 }
