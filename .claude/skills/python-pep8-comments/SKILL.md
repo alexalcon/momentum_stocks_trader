@@ -1,6 +1,6 @@
 ---
-name: python-pep8-comments
-description: Apply PEP 8-compliant Python commenting conventions to all generated code, tailored for algorithmic trading systems. Use this skill EVERY TIME code is generated, written, or modified in this project. Trigger on any Python code output — new modules, functions, classes, configuration blocks, database models, API routes, trading pipeline stages, risk engine logic, signal generators, order managers, and test files. Also trigger when the user says "add comments", "document this", "annotate", "write code for X", "implement X", or any variation requesting Python code. This skill is ALWAYS active for Python code in this project — never skip it even for short snippets or utility functions.
+name: "python-pep8-comments"
+description: "Apply PEP 8-compliant Python commenting conventions to all generated code, tailored for algorithmic trading systems. Use this skill EVERY TIME code is generated, written, or modified in this project. Trigger on any Python code output — new modules, functions, classes, configuration blocks, database models, API routes, trading pipeline stages, risk engine logic, signal generators, order managers, and test files. Also trigger when the user says 'add comments', 'document this', 'annotate', 'write code for X', 'implement X', or any variation requesting Python code. This skill is ALWAYS active for Python code in this project — never skip it even for short snippets or utility functions."
 ---
 
 # Python PEP 8 Comments Skill
@@ -14,7 +14,7 @@ This skill enforces consistent, PEP 8-compliant Python commenting for all code i
 3. Block comments: `#` followed by one space, aligned to the code block's indentation level.
 4. No redundant comments. Never restate what the code obviously does.
 5. Comment the WHY and the WHAT (architectural intent, trading logic, risk invariants), not the HOW (Python syntax).
-6. Section separators use `# ---` with a label, 79 chars total.
+6. Section separators use the Unicode box-drawing character `─` (U+2500), NOT hyphens `-`. The full line must be exactly 79 characters: `# ` (2 chars) followed by 77 `─` characters.
 7. No trailing whitespace on comment lines.
 8. All docstrings use triple double-quotes `"""`.
 
@@ -30,17 +30,16 @@ Every module starts with a docstring immediately after any `from __future__` imp
 """
 thesis_engine.py -- LLM Thesis Engine (Component: thesis_engine)
 
-Generates a structured directional swing thesis (long/short/flat) for a
-single crypto asset. Inputs: multi-timeframe OHLCV (1D regime, 4H trend,
-1H signal), raw news headlines, and the symbol's active or prior thesis.
-Output: a validated ThesisOutput schema object.
+Generates a structured directional thesis (long/short/flat) for a single
+crypto asset per daily session. Inputs: OHLCV price data, Hugging Face
+sentiment scores, and the previous thesis from the database. Output: a
+validated ThesisOutput schema object.
 
 Invariants:
     - The LLM never sizes or places orders. Direction only.
     - Malformed or out-of-band outputs are rejected before returning.
     - Re-evaluation always loads the prior thesis; cold-start is allowed
       only if no prior thesis exists for this symbol.
-    - One active thesis per symbol, enforced at the database level.
 """
 ```
 
@@ -55,8 +54,7 @@ class RiskEngine:
     resize, or reject a proposed order.
 
     Pipeline stage: post-confluence, pre-execution.
-    Thread safety: one instance per backend process; the fast loop and
-    the event path may call it concurrently.
+    Thread safety: single-threaded; one instance per backend session.
 
     Raises:
         RiskRejectionError: when an order breaches any hard limit.
@@ -77,8 +75,7 @@ def evaluate_confluence(
     Return True only when LLM thesis and technical signal agree.
 
     Neither side alone is sufficient to open a position. Disagreement
-    is logged and the symbol is skipped for this pass; the next
-    completed candle re-evaluates it.
+    is logged and the session skips this symbol for the day.
 
     Parameters
     ----------
@@ -118,20 +115,20 @@ stop_pct = 0.02  # 2 % stop; must sit inside liquidation distance
 One `#` per line, one space after, aligned to the surrounding code. Use for multi-line explanations before a logical unit.
 
 ```python
-# Re-evaluation path: load the ACTIVE thesis so the LLM reconciles the
-# view currently justifying an open position, not merely the last one
-# that finished. Cold-start (no prior thesis) is the first pass only.
+# Re-evaluation path: load the prior thesis so the LLM can reconcile
+# its previous directional view with today's price and sentiment data.
+# Cold-start (no prior thesis) is allowed on the first session only.
 prior_thesis = self.db.load_latest_thesis(symbol)
 ```
 
 ### Section Separator
 
-Use inside long modules or classes to separate pipeline stages. Total line length 79 chars.
+Use inside long modules or classes to separate pipeline stages. Use the Unicode box-drawing character `─` (U+2500), never hyphens. The line must be exactly 79 characters: `# ` followed by 77 `─` characters.
 
 ```python
-# ---------------------------------------------------------------------------
-# Phase 2 -- News ingestion and multi-timeframe thesis generation
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Application lifespan -- ordered startup and shutdown
+# ─────────────────────────────────────────────────────────────────────────────
 ```
 
 ### TODO / FIXME / NOTE
@@ -140,8 +137,7 @@ Always include a reference tag so items are traceable.
 
 ```python
 # TODO(phase3): replace placeholder thresholds with backtested values
-# TODO(phase5): re-derive holding horizons from the backtest
-# FIXME: orphaned-order handling not yet implemented
+# FIXME(DEV-3): orphaned-order handling not yet implemented
 # NOTE: drawdown kill switch fires here; downstream must treat this as terminal
 ```
 
@@ -160,18 +156,16 @@ Apply the matching pattern based on which component the code belongs to.
 ```python
 # Inject prior thesis so the model reconciles its previous view rather
 # than producing a stateless, potentially contradictory decision.
-payload = build_skill_payload(
-    ohlcv_1d=regime_frame,      # what kind of market this is
-    ohlcv_4h=trend_frame,       # the structure the position rides
-    ohlcv_1h=signal_frame,      # where entry and stop belong
-    headlines=headlines,        # raw text; the skill reads it directly
+prompt = build_thesis_prompt(
+    price_data=ohlcv,
+    sentiment=sentiment_scores,
     prior_thesis=prior_thesis,  # None triggers cold-start branch
 )
 ```
 
 ### risk_manager
 
-- Every limit must carry the category it enforces (from the V3 spec).
+- Every limit must carry the category it enforces (from the V2 spec).
 - Rejection reasons must be explicit strings, not codes.
 - Liquidation distance check must comment the formula used.
 
@@ -223,9 +217,7 @@ klines = self.client.futures_klines(
 - Mark the output contract: direction must be one of {'long', 'short', 'flat'}.
 
 ```python
-# EMA crossover on the 4H trend frame: fast=9, slow=21. Direction comes
-# from the higher timeframes; the 1H frame only times the entry, because
-# an hourly reversal against a 4H trend is noise on a multi-day hold.
+# EMA crossover signal: fast=9, slow=21 (standard intraday configuration).
 # Output contract: direction in {'long', 'short', 'flat'}.
 # 'flat' is emitted when fast and slow EMAs are within the noise band.
 ```
@@ -233,59 +225,46 @@ klines = self.client.futures_klines(
 ### portfolio_store / database models (SQLAlchemy)
 
 - Each column comment states its role and any constraint rationale.
-- A constraint that enforces a system invariant must carry a comment explaining why it is a DB-level rule, not a runtime check.
+- The daily_ledger UNIQUE constraint must carry a comment explaining why it is a DB-level rule, not a runtime check.
 
 ```python
-class Thesis(Base):
+class DailyLedger(Base):
     """
-    Per-symbol thesis, governing that symbol until it closes.
+    Enforces one trade per crypto per day at the database level.
 
-    A thesis opens, lives for its horizon -- which may span several UTC
-    dates and several service restarts -- and closes for a stated
-    reason. The partial unique index below is the hard guarantee that
-    only one governs a symbol at a time. Runtime checks alone are
-    insufficient because the fast loop and an event-driven
-    re-evaluation could race and open two competing theses.
+    The UNIQUE constraint on (symbol, date) is the hard guarantee.
+    Runtime checks alone are insufficient because a race or crash
+    could allow a duplicate insert.
     """
-    __tablename__ = "theses"
+    __tablename__ = "daily_ledger"
 
     id = Column(Integer, primary_key=True)
-    thesis_uid = Column(String(36), nullable=False, unique=True)
     symbol = Column(String, nullable=False)   # Binance USDT-M symbol
-    status = Column(String, nullable=False)   # active|closed|superseded
-    expires_at = Column(DateTime)             # the time stop
+    date = Column(Date, nullable=False)       # UTC session date
+    trade_id = Column(Integer, ForeignKey("trades.id"), nullable=False)
 
     __table_args__ = (
-        # DB-level guard: at most one active row per symbol. Partial
-        # rather than a plain UNIQUE because closed and superseded rows
-        # must remain -- they are the thesis history re-evaluation
-        # reads.
-        Index(
-            "uq_active_thesis_per_symbol",
-            "symbol",
-            unique=True,
-            sqlite_where=text("status = 'active'"),
-        ),
+        # DB-level guard: one row per (symbol, date) pair.
+        # This is not redundant with runtime checks -- it is the
+        # authoritative enforcement mechanism.
+        UniqueConstraint("symbol", "date", name="uq_ledger_symbol_date"),
     )
 ```
 
 ### dashboard (FastAPI routes)
 
 - Comment the HTTP method, route purpose, and which backend component it delegates to.
-- Mark any state mutations that affect the service state machine.
-- Where a control is easy to confuse with a more destructive one, say what it does NOT do.
+- Mark any state mutations that affect the session state machine.
 
 ```python
-@router.post("/strategy/stop")
-def stop_strategy(request: Request) -> ServiceStatus:
+@router.post("/session/start")
+async def start_session(background_tasks: BackgroundTasks) -> dict:
     """
-    Stop strategy execution, leaving positions open and protected.
+    Trigger the daily session pipeline (14:30 UTC nominal start).
 
-    Mutates service state: running_* -> stopping -> stopped, and
-    disables new entries. Does NOT close positions: stop-loss and
-    take-profit legs are deliberately left resting at the exchange so
-    open positions stay defended after this process exits. Closing
-    them is /emergency-flat's job.
+    Mutates session state: idle -> active. Spawns the per-crypto
+    analysis loop as a background task so the HTTP response returns
+    immediately.
     """
 ```
 
@@ -329,6 +308,7 @@ symbol: str = "BTCUSDT"  # symbol is a string
 - [ ] Every public method has a NumPy-style docstring.
 - [ ] Inline comments: 2 spaces before `#`, 1 space after, max 79 chars.
 - [ ] Block comments explain WHY, not WHAT.
+- [ ] Section separators: `─` (U+2500), exactly 79 chars total (`# ` + 77 `─`).
 - [ ] Risk limits and confluence rules carry category labels.
 - [ ] UNIQUE DB constraint carries the "why DB-level, not runtime" note.
 - [ ] No secrets values in comments.
