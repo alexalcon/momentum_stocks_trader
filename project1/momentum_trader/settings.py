@@ -132,3 +132,7 @@ MAILERS = {
 
 # MASSIVE API key
 MASSIVE_API_KEY = config('MASSIVE_API_KEY', default='')
+
+# SnapTrade API credentials
+SNAPTRADE_CLIENT_ID = config("SNAPTRADE_CLIENT_ID", default="")
+SNAPTRADE_CLIENT_SECRET = config("SNAPTRADE_CLIENT_SECRET", default="")
