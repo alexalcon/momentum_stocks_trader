@@ -136,3 +136,7 @@ MASSIVE_API_KEY = config('MASSIVE_API_KEY', default='')
 # SnapTrade API credentials
 SNAPTRADE_CLIENT_ID = config("SNAPTRADE_CLIENT_ID", default="")
 SNAPTRADE_CLIENT_SECRET = config("SNAPTRADE_CLIENT_SECRET", default="")
+
+# Momentum strategy settings
+MOMENTUM_LOOKBACK_MONTHS = 12
+MOMENTUM_SKIP_MONTHS = 1
