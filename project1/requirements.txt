@@ -1,4 +1,4 @@
 Django
 massive
 python-decouple
-snaptrade-python-sdk
+snaptrade-python-sdk==13.0.36

@@ -23,9 +23,10 @@ from decimal import Decimal
 import logging
 
 from django.conf import settings
-from snaptrade_client import SnapTrade
+from snaptrade_client import SnapTrade, SnapTradeAuth
 
-from trading.models import Stock, Trade
+from trading.models import Stock
+from portfolio.models import Trade
 from portfolio.models import Portfolio
 from portfolio.models import Position
 
@@ -46,8 +47,10 @@ class TradingExecutor:
         # App-level credentials. Source: Django settings, populated from
         # the environment. Per-user secrets are supplied per call instead.
         self.snaptrade = SnapTrade(
-            consumer_key=settings.SNAPTRADE_CLIENT_SECRET,
-            client_id=settings.SNAPTRADE_CLIENT_ID,
+            auth=SnapTradeAuth.commercial_api_key(
+                consumer_key=settings.SNAPTRADE_CLIENT_SECRET,
+                client_id=settings.SNAPTRADE_CLIENT_ID,
+            ),
         )
 
     # ─────────────────────────────────────────────────────────────────────────

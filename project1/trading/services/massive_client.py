@@ -2,14 +2,15 @@
 massive_client.py -- Massive market-data client (Component: data_ingestion)
 
 Wraps the Massive REST API to supply daily OHLCV bars and the two
-reference closes the momentum ranking needs: the close ~12 months ago
-and the close ~1 month ago. The window deliberately skips the most
+reference closes the 12-1 momentum ranking needs: the close ~12 months
+ago and the close ~1 month ago. The window deliberately skips the most
 recent month, which is dominated by short-term reversal rather than
 momentum.
 
-Data source: Massive REST only (no websocket). Primary path for the
-momentum snapshot is the grouped daily endpoint (one call returns the
-whole market for one date); per-ticker aggregates are the fallback.
+Data source: Massive REST only (no websocket), daily bars. Primary path
+for the momentum snapshot is the grouped daily endpoint (one call
+returns the whole market for one date); per-ticker aggregates are the
+fallback.
 
 Invariants:
     - Every outbound request passes through ``_rate_limit`` first.
@@ -18,15 +19,14 @@ Invariants:
       downstream code can tell "missing" from "worthless".
 """
 
+from django.conf import settings
+from massive import RESTClient
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import logging
 import time
 from urllib3.exceptions import MaxRetryError
-
-from django.conf import settings
-import pandas as pd
-from massive import RESTClient
 from massive.exceptions import BadResponse
 
 logger = logging.getLogger(__name__)
@@ -61,19 +61,10 @@ class MassiveAPIClient:
         self.api_key = api_key or settings.MASSIVE_API_KEY
         if not self.api_key:
             raise ValueError("Massive API key is required")
-        self.requests_per_minute = requests_per_minute
         self.client = RESTClient(self.api_key)
-        self._cache = {}  # per-instance; unbounded, no expiry
+        self.requests_per_minute = requests_per_minute
         self.request_times = []  # epoch seconds of recent requests
-
-    def _get_cache_key(self, ticker: str, start_date: str, end_date: str) -> str:
-        """
-        Build the cache key for a per-ticker aggregates request.
-
-        NOTE: multiplier, timespan and adjusted are not part of the key,
-        so requests differing only in those share one cache entry.
-        """
-        return f"{ticker}:{start_date}:{end_date}"
+        self._cache = {}  # per-instance; unbounded, no expiry
 
     def _rate_limit(self):
         """
@@ -92,7 +83,19 @@ class MassiveAPIClient:
                 logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
                 time.sleep(sleep_time)
 
+        # FIXME(data-ingestion): records the pre-sleep time, so after a
+        # throttle the window treats this request as older than it is
+        # and back-to-back bursts can slightly exceed the budget.
         self.request_times.append(current_time)
+
+    def _get_cache_key(self, ticker: str, start_date: str, end_date: str) -> str:
+        """
+        Build the cache key for a per-ticker aggregates request.
+
+        NOTE: multiplier, timespan and adjusted are not part of the key,
+        so requests differing only in those share one cache entry.
+        """
+        return f"{ticker}:{start_date}:{end_date}"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Per-ticker aggregates
@@ -109,11 +112,10 @@ class MassiveAPIClient:
         limit: int = 50000,
         use_cache: bool = True,
         max_retries: int = 3,
-        retry_delay: int = 60,
+        retry_delay: int = 60
     ) -> List[Dict]:
         """
-        Fetch OHLCV bars for one ticker over a date range 
-        (start_date to end_date).
+        Fetch OHLCV bars for one ticker over a date range.
 
         Retries only on HTTP 429 (surfaced by urllib3 as MaxRetryError);
         every other error is raised immediately, since retrying a bad
@@ -155,7 +157,7 @@ class MassiveAPIClient:
         """
         cache_key = self._get_cache_key(ticker, start_date, end_date)
 
-        if use_cache and (cache_key in self._cache):
+        if use_cache and cache_key in self._cache:
             logger.info(f"Using cached data for {ticker}")
             return self._cache[cache_key]
 
@@ -177,20 +179,18 @@ class MassiveAPIClient:
                     adjusted=adjusted,
                     limit=limit,
                 ):
-                    aggs.append(
-                        {
-                            # Massive timestamps are epoch milliseconds.
-                            "date": datetime.fromtimestamp(agg.timestamp / 1000).date(),
-                            "open": agg.open,
-                            "high": agg.high,
-                            "low": agg.low,
-                            "close": agg.close,
-                            "volume": agg.volume,
-                            # Optional fields: absent on some bars.
-                            "vwap": getattr(agg, "vwap", None),
-                            "transactions": getattr(agg, "transactions", None),
-                        }
-                    )
+                    aggs.append({
+                        # Massive timestamps are epoch milliseconds.
+                        'date': datetime.fromtimestamp(agg.timestamp / 1000).date(),
+                        'open': agg.open,
+                        'high': agg.high,
+                        'low': agg.low,
+                        'close': agg.close,
+                        'volume': agg.volume,
+                        # Optional fields: absent on some bars.
+                        'vwap': getattr(agg, 'vwap', None),
+                        'transactions': getattr(agg, 'transactions', None),
+                    })
 
                 if use_cache:
                     self._cache[cache_key] = aggs
@@ -200,9 +200,7 @@ class MassiveAPIClient:
 
             except MaxRetryError as e:
                 if "429" in str(e) and attempt < max_retries - 1:
-                    logger.warning(
-                        f"Rate limited on attempt {attempt + 1} for {ticker}, retrying in {retry_delay} seconds"
-                    )
+                    logger.warning(f"Rate limited on attempt {attempt + 1} for {ticker}, retrying in {retry_delay} seconds")
                     time.sleep(retry_delay)
                     continue
                 else:
@@ -212,12 +210,82 @@ class MassiveAPIClient:
                 logger.error(f"Error fetching data for {ticker}: {str(e)}")
                 raise
 
+    def fetch_multiple_stocks(
+        self,
+        tickers: List[str],
+        start_date: str,
+        end_date: str,
+        adjusted: bool = True,
+        batch_size: int = 10,
+        delay_between_batches: int = 12
+    ) -> Dict[str, List[Dict]]:
+        """
+        Fetch OHLCV bars for many tickers, batched to respect rate limits.
+
+        A failure on one ticker is logged and recorded as an empty list
+        so the rest of the batch still completes.
+
+        Parameters
+        ----------
+        tickers : list of str
+            Tickers to fetch.
+        start_date, end_date : str
+            Inclusive range in 'YYYY-MM-DD' format.
+        adjusted : bool, default True
+            Return split/dividend-adjusted prices.
+        batch_size : int, default 10
+            Tickers per batch.
+        delay_between_batches : int, default 12
+            Extra seconds to sleep between batches, on top of the
+            per-request limiter.
+
+        Returns
+        -------
+        dict
+            ``{ticker: list of bar dicts}`` as returned by
+            ``fetch_stock_data``; an empty list marks a failed ticker.
+        """
+        results = {}
+        total_tickers = len(tickers)
+
+        logger.info(f"Fetching data for {total_tickers} stocks in batches of {batch_size}")
+
+        for i in range(0, total_tickers, batch_size):
+            batch_tickers = tickers[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            # Ceiling division: a partial final batch still counts.
+            total_batches = (total_tickers + batch_size - 1) // batch_size
+
+            logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch_tickers)} stocks)")
+
+            for ticker in batch_tickers:
+                try:
+                    results[ticker] = self.fetch_stock_data(
+                        ticker=ticker,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjusted=adjusted
+                    )
+                    logger.info(f"Successfully fetched data for {ticker}")
+                except (MaxRetryError, ValueError, TypeError, BadResponse) as e:
+                    logger.error(f"Failed to fetch data for {ticker}: {str(e)}")
+                    results[ticker] = []
+
+            # No sleep after the final batch.
+            if i + batch_size < total_tickers:
+                logger.info(f"Waiting {delay_between_batches} seconds before next batch...")
+                time.sleep(delay_between_batches)
+
+        return results
+
     # ─────────────────────────────────────────────────────────────────────────
     # Momentum snapshot (12-month and 1-month reference closes)
     # ─────────────────────────────────────────────────────────────────────────
 
     def fetch_bulk_momentum_data(
-        self, tickers: List[str], calculation_date: datetime = None
+        self,
+        tickers: List[str],
+        calculation_date: datetime = None
     ) -> Dict[str, Dict[str, Optional[float]]]:
         """
         Fetch the 12-month and 1-month reference closes for many tickers.
@@ -250,85 +318,72 @@ class MassiveAPIClient:
         twelve_months_ago = calculation_date - timedelta(days=365)
         one_month_ago = calculation_date - timedelta(days=30)
 
-        logger.info(
-            f"TRUE bulk fetching momentum data for {len(tickers)} stocks using grouped daily API"
-        )
+        logger.info(f"TRUE bulk fetching momentum data for {len(tickers)} stocks using grouped daily API")
         logger.info(f"Target dates: 12m={twelve_months_ago}, 1m={one_month_ago}")
+
+        momentum_data = {}
 
         # Pre-seed so tickers absent from both responses still appear in
         # the result with explicit Nones.
-        momentum_data = {}
         for ticker in tickers:
-            momentum_data[ticker] = {"price_12m": None, "price_1m": None}
+            momentum_data[ticker] = {'price_12m': None, 'price_1m': None}
 
         try:
             self._rate_limit()
 
-            logger.info(
-                f"Fetching grouped daily data for 12 months ago ({twelve_months_ago})"
-            )
+            # Call 1 of 2: whole market on the 12-month reference date.
+            logger.info(f"Fetching grouped daily data for 12 months ago ({twelve_months_ago})")
             twelve_month_data = self.client.get_grouped_daily_aggs(
-                date=twelve_months_ago, adjusted=True
+                date=twelve_months_ago,
+                adjusted=True
             )
 
             # The response covers the whole market; keep only our universe.
             twelve_month_prices = {}
             for agg in twelve_month_data:
-                if hasattr(agg, "ticker") and agg.ticker in tickers:
+                if hasattr(agg, 'ticker') and agg.ticker in tickers:
                     twelve_month_prices[agg.ticker] = float(agg.close)
 
             logger.info(f"Found 12-month prices for {len(twelve_month_prices)} stocks")
 
             self._rate_limit()
 
-            logger.info(
-                f"Fetching grouped daily data for 1 month ago ({one_month_ago})"
-            )
+            # Call 2 of 2: whole market on the 1-month reference date.
+            logger.info(f"Fetching grouped daily data for 1 month ago ({one_month_ago})")
             one_month_data = self.client.get_grouped_daily_aggs(
-                date=one_month_ago, adjusted=True
+                date=one_month_ago,
+                adjusted=True
             )
 
             one_month_prices = {}
             for agg in one_month_data:
-                if hasattr(agg, "ticker") and agg.ticker in tickers:
+                if hasattr(agg, 'ticker') and agg.ticker in tickers:
                     one_month_prices[agg.ticker] = float(agg.close)
 
             logger.info(f"Found 1-month prices for {len(one_month_prices)} stocks")
 
             for ticker in tickers:
                 momentum_data[ticker] = {
-                    "price_12m": twelve_month_prices.get(ticker),
-                    "price_1m": one_month_prices.get(ticker),
+                    'price_12m': twelve_month_prices.get(ticker),
+                    'price_1m': one_month_prices.get(ticker)
                 }
 
-                logger.debug(
-                    f"Momentum data for {ticker}: "
-                    f"12m=${momentum_data[ticker]['price_12m']}, "
-                    f"1m=${momentum_data[ticker]['price_1m']}"
-                )
+                logger.debug(f"Momentum data for {ticker}: "
+                           f"12m=${momentum_data[ticker]['price_12m']}, "
+                           f"1m=${momentum_data[ticker]['price_1m']}")
 
             # A reference date landing on a non-trading day returns an
             # empty or partial market; resolve those tickers from nearby
             # dates instead.
-            missing_tickers = [
-                t
-                for t in tickers
-                if not momentum_data[t]["price_12m"] or not momentum_data[t]["price_1m"]
-            ]
+            missing_tickers = [t for t in tickers if not momentum_data[t]['price_12m'] or not momentum_data[t]['price_1m']]
             if missing_tickers:
-                logger.info(
-                    f"Handling {len(missing_tickers)} stocks with missing data using fallback dates"
-                )
-                momentum_data = self._handle_missing_data_fallback(
-                    momentum_data, missing_tickers, calculation_date
-                )
+                logger.info(f"Handling {len(missing_tickers)} stocks with missing data using fallback dates")
+                momentum_data = self._handle_missing_data_fallback(momentum_data, missing_tickers, calculation_date)
 
             logger.info(f"Successfully fetched momentum data using only 2 API calls!")
 
         except Exception as e:
-            logger.error(
-                f"Error with grouped daily API, falling back to individual calls: {str(e)}"
-            )
+            logger.error(f"Error with grouped daily API, falling back to individual calls: {str(e)}")
             # Fallback: per-ticker aggregates. Far slower (one request per
             # ticker under the same rate budget) but independent of the
             # grouped endpoint.
@@ -336,74 +391,11 @@ class MassiveAPIClient:
 
         return momentum_data
 
-    def _fetch_bulk_momentum_data_fallback(
-        self, tickers: List[str], calculation_date: datetime
-    ) -> Dict[str, Dict[str, Optional[float]]]:
-        """
-        Resolve momentum reference closes via per-ticker aggregates.
-
-        Used only when the grouped daily endpoint fails. Fetches one
-        range per ticker that spans both reference dates, then picks the
-        bar nearest each date. Returns the same shape as
-        ``fetch_bulk_momentum_data``.
-        """
-        logger.warning("Using fallback method - this will be slower")
-
-        twelve_months_ago = calculation_date - timedelta(days=365)
-        one_month_ago = calculation_date - timedelta(days=30)
-
-        # One range covers both reference dates, so each ticker costs a
-        # single request. The 30-day lead guarantees trading days exist
-        # before the 12-month date; the 7-day tail is slack at the end.
-        start_date = twelve_months_ago - timedelta(days=30)
-        end_date = calculation_date + timedelta(days=7)
-
-        logger.info(
-            f"Fallback: fetching momentum data for {len(tickers)} stocks from {start_date} to {end_date}"
-        )
-
-        all_data = self.fetch_multiple_stocks(
-            tickers=tickers,
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-            batch_size=5,  # one batch fills the 5 req/min budget
-            delay_between_batches=15,
-        )
-
-        momentum_data = {}
-
-        for ticker in tickers:
-            data = all_data.get(ticker, [])
-            if not data:
-                momentum_data[ticker] = {"price_12m": None, "price_1m": None}
-                continue
-
-            df = pd.DataFrame(data)
-            if df.empty:
-                momentum_data[ticker] = {"price_12m": None, "price_1m": None}
-                continue
-
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date")
-
-            # FIXME(data-ingestion): _find_closest_price is not defined on
-            # this class, so this fallback raises AttributeError when hit.
-            price_12m = self._find_closest_price(df, twelve_months_ago)
-            price_1m = self._find_closest_price(df, one_month_ago)
-
-            momentum_data[ticker] = {"price_12m": price_12m, "price_1m": price_1m}
-
-            logger.debug(
-                f"Momentum data for {ticker}: 12m=${price_12m}, 1m=${price_1m}"
-            )
-
-        return momentum_data
-
     def _handle_missing_data_fallback(
         self,
         momentum_data: Dict[str, Dict[str, Optional[float]]],
         missing_tickers: List[str],
-        calculation_date: datetime,
+        calculation_date: datetime
     ) -> Dict[str, Dict[str, Optional[float]]]:
         """
         Fill missing reference closes from dates near the targets.
@@ -427,16 +419,15 @@ class MassiveAPIClient:
             try:
                 self._rate_limit()
                 fallback_12m_data = self.client.get_grouped_daily_aggs(
-                    date=fallback_12m_date, adjusted=True
+                    date=fallback_12m_date,
+                    adjusted=True
                 )
 
                 for agg in fallback_12m_data:
-                    if hasattr(agg, "ticker") and agg.ticker in missing_tickers:
-                        if not momentum_data[agg.ticker]["price_12m"]:
-                            momentum_data[agg.ticker]["price_12m"] = float(agg.close)
-                            logger.debug(
-                                f"Found 12m price for {agg.ticker} on {fallback_12m_date}"
-                            )
+                    if hasattr(agg, 'ticker') and agg.ticker in missing_tickers:
+                        if not momentum_data[agg.ticker]['price_12m']:
+                            momentum_data[agg.ticker]['price_12m'] = float(agg.close)
+                            logger.debug(f"Found 12m price for {agg.ticker} on {fallback_12m_date}")
             # FIXME(data-ingestion): bare except hides auth and network
             # failures as well as the expected no-data responses.
             except:
@@ -446,107 +437,272 @@ class MassiveAPIClient:
             try:
                 self._rate_limit()
                 fallback_1m_data = self.client.get_grouped_daily_aggs(
-                    date=fallback_1m_date, adjusted=True
+                    date=fallback_1m_date,
+                    adjusted=True
                 )
 
                 for agg in fallback_1m_data:
-                    if hasattr(agg, "ticker") and agg.ticker in missing_tickers:
-                        if not momentum_data[agg.ticker]["price_1m"]:
-                            momentum_data[agg.ticker]["price_1m"] = float(agg.close)
-                            logger.debug(
-                                f"Found 1m price for {agg.ticker} on {fallback_1m_date}"
-                            )
+                    if hasattr(agg, 'ticker') and agg.ticker in missing_tickers:
+                        if not momentum_data[agg.ticker]['price_1m']:
+                            momentum_data[agg.ticker]['price_1m'] = float(agg.close)
+                            logger.debug(f"Found 1m price for {agg.ticker} on {fallback_1m_date}")
             except:
                 pass
 
             # Shrink the set so the loop can exit early once all resolve.
-            missing_tickers = [
-                t
-                for t in missing_tickers
-                if not momentum_data[t]["price_12m"] or not momentum_data[t]["price_1m"]
-            ]
+            missing_tickers = [t for t in missing_tickers
+                             if not momentum_data[t]['price_12m'] or not momentum_data[t]['price_1m']]
 
         return momentum_data
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Batch and point-in-time helpers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def fetch_multiple_stocks(
+    def _fetch_bulk_momentum_data_fallback(
         self,
         tickers: List[str],
-        start_date: str,
-        end_date: str,
-        adjusted: bool = True,
-        batch_size: int = 10,
-        delay_between_batches: int = 12,
-    ) -> Dict[str, List[Dict]]:
+        calculation_date: datetime
+    ) -> Dict[str, Dict[str, Optional[float]]]:
         """
-        Fetch OHLCV bars for many tickers, batched to respect rate limits.
+        Resolve momentum reference closes via per-ticker aggregates.
 
-        A failure on one ticker is logged and recorded as an empty list
-        so the rest of the batch still completes.
+        Used only when the grouped daily endpoint fails. Fetches one
+        range per ticker that spans both reference dates, then picks the
+        bar nearest each date. Returns the same shape as
+        ``fetch_bulk_momentum_data``.
+        """
+        logger.warning("Using fallback method - this will be slower")
+
+        twelve_months_ago = calculation_date - timedelta(days=365)
+        one_month_ago = calculation_date - timedelta(days=30)
+
+        # One range covers both reference dates, so each ticker costs a
+        # single request. The 30-day lead guarantees trading days exist
+        # before the 12-month date; the 7-day tail is slack at the end.
+        start_date = twelve_months_ago - timedelta(days=30)
+        end_date = calculation_date + timedelta(days=7)
+
+        logger.info(f"Fallback: fetching momentum data for {len(tickers)} stocks from {start_date} to {end_date}")
+
+        all_data = self.fetch_multiple_stocks(
+            tickers=tickers,
+            start_date=start_date.strftime('%Y-%m-%d'),
+            end_date=end_date.strftime('%Y-%m-%d'),
+            batch_size=5,  # one batch fills the 5 req/min budget
+            delay_between_batches=15
+        )
+
+        momentum_data = {}
+
+        for ticker in tickers:
+            data = all_data.get(ticker, [])
+            if not data:
+                momentum_data[ticker] = {'price_12m': None, 'price_1m': None}
+                continue
+
+            df = pd.DataFrame(data)
+            if df.empty:
+                momentum_data[ticker] = {'price_12m': None, 'price_1m': None}
+                continue
+
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date')
+
+            price_12m = self._find_closest_price(df, twelve_months_ago)
+            price_1m = self._find_closest_price(df, one_month_ago)
+
+            momentum_data[ticker] = {
+                'price_12m': price_12m,
+                'price_1m': price_1m
+            }
+
+            logger.debug(f"Momentum data for {ticker}: 12m=${price_12m}, 1m=${price_1m}")
+
+        return momentum_data
+
+    def _find_closest_price(self, df: pd.DataFrame, target_date: datetime, tolerance_days: int = 7) -> Optional[float]:
+        """
+        Return the close nearest to ``target_date`` within a tolerance.
+
+        Ties in distance go to the earlier bar: ``df`` arrives sorted by
+        date and ``idxmin`` returns the first match.
 
         Parameters
         ----------
-        tickers : list of str
-            Tickers to fetch.
-        start_date, end_date : str
-            Inclusive range in 'YYYY-MM-DD' format.
-        adjusted : bool, default True
-            Return split/dividend-adjusted prices.
-        batch_size : int, default 10
-            Tickers per batch.
-        delay_between_batches : int, default 12
-            Extra seconds to sleep between batches, on top of the
-            per-request limiter.
+        df : pandas.DataFrame
+            Bars with a datetime64 ``date`` column and a ``close``
+            column. Mutated: a ``date_diff`` helper column is added.
+        target_date : datetime or date
+            Reference date to price.
+        tolerance_days : int, default 7
+            Max distance in calendar days; matches the +/-7 day window
+            of the grouped-daily gap filler.
 
         Returns
         -------
-        dict
-            ``{ticker: list of bar dicts}`` as returned by
-            ``fetch_stock_data``; an empty list marks a failed ticker.
+        float or None
+            Nearest close, or None if no bar lies within the tolerance.
         """
-        results = {}
-        total_tickers = len(tickers)
+        if df.empty:
+            return None
 
-        logger.info(
-            f"Fetching data for {total_tickers} stocks in batches of {batch_size}"
+        target_date = pd.Timestamp(target_date)
+        df['date_diff'] = abs(df['date'] - target_date)
+
+        tolerance = pd.Timedelta(days=tolerance_days)
+        within_tolerance = df[df['date_diff'] <= tolerance]
+
+        if within_tolerance.empty:
+            return None
+
+        closest_row = within_tolerance.loc[within_tolerance['date_diff'].idxmin()]
+        return float(closest_row['close'])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Full-history helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_historical_data_for_momentum(
+        self,
+        ticker: str,
+        calculation_date: Optional[datetime] = None
+    ) -> List[Dict]:
+        """
+        Fetch ~14 months of daily bars for one ticker.
+
+        420 calendar days covers the 12-month lookback plus a ~2-month
+        buffer, so the 12-month reference date always falls inside the
+        range even across holidays.
+
+        Parameters
+        ----------
+        ticker : str
+            Exchange ticker, e.g. 'AAPL'.
+        calculation_date : datetime or date, optional
+            End of the range. Defaults to today.
+
+        Returns
+        -------
+        list of dict
+            Bars as returned by ``fetch_stock_data``.
+        """
+        if calculation_date is None:
+            calculation_date = datetime.now().date()
+
+        start_date = calculation_date - timedelta(days=420)  # ~14 months
+        end_date = calculation_date
+
+        return self.fetch_stock_data(
+            ticker=ticker,
+            start_date=start_date.strftime('%Y-%m-%d'),
+            end_date=end_date.strftime('%Y-%m-%d')
         )
 
-        for i in range(0, total_tickers, batch_size):
-            batch_tickers = tickers[i : i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (total_tickers + batch_size - 1) // batch_size  # ceil
+    def validate_stock_data_sufficiency(
+        self,
+        data: List[Dict],
+        required_days: int = 280
+    ) -> bool:
+        """
+        Return True if ``data`` holds enough bars for a momentum score.
 
-            logger.info(
-                f"Processing batch {batch_num}/{total_batches} ({len(batch_tickers)} stocks)"
-            )
+        Parameters
+        ----------
+        data : list of dict
+            Bars as returned by ``fetch_stock_data``.
+        required_days : int, default 280
+            Minimum number of trading-day bars. A 420-calendar-day fetch
+            yields ~289 trading days, so 280 tolerates a few missing bars
+            while rejecting tickers listed less than ~13 months ago.
 
-            for ticker in batch_tickers:
-                try:
-                    results[ticker] = self.fetch_stock_data(
-                        ticker=ticker,
-                        start_date=start_date,
-                        end_date=end_date,
-                        adjusted=adjusted,
-                    )
-                    logger.info(f"Successfully fetched data for {ticker}")
-                except (MaxRetryError, ValueError, TypeError, BadResponse) as e:
-                    logger.error(f"Failed to fetch data for {ticker}: {str(e)}")
-                    results[ticker] = []
+        Returns
+        -------
+        bool
+            False if ``data`` is empty or shorter than ``required_days``.
+        """
+        if not data or len(data) < required_days:
+            logger.warning(f"Insufficient data: {len(data) if data else 0} days, required: {required_days}")
+            return False
+        return True
 
-            # No sleep after the final batch.
-            if i + batch_size < total_tickers:
-                logger.info(
-                    f"Waiting {delay_between_batches} seconds before next batch..."
-                )
-                time.sleep(delay_between_batches)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Universe and DataFrame utilities
+    # ─────────────────────────────────────────────────────────────────────────
 
-        return results
+    def get_sp500_tickers(self) -> List[str]:
+        """
+        Return a static 50-ticker large-cap subset of the S&P 500.
+
+        NOTE: both GOOGL and GOOG are listed, so Alphabet can occupy two
+        slots in the momentum ranking.
+        """
+        # TODO(data-ingestion): load the full constituent list from an API
+        # or a database table instead of this hard-coded subset.
+        return [
+            'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'GOOG', 'META', 'TSLA', 'BRK.B', 'UNH',
+            'JNJ', 'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'BAC', 'ABBV',
+            'PFE', 'AVGO', 'KO', 'COST', 'DIS', 'TMO', 'WMT', 'DHR', 'NEE', 'VZ',
+            'ABT', 'MRK', 'ADBE', 'CRM', 'NFLX', 'NKE', 'INTC', 'AMD', 'T', 'TXN',
+            'COP', 'LLY', 'PM', 'RTX', 'HON', 'CMCSA', 'UPS', 'QCOM', 'SBUX', 'LOW'
+        ]
+
+    def create_dataframe_from_aggs(self, aggs: List[Dict]) -> pd.DataFrame:
+        """
+        Convert bar dicts into a date-indexed DataFrame.
+
+        Parameters
+        ----------
+        aggs : list of dict
+            Bars as returned by ``fetch_stock_data``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Indexed by datetime64 ``date``, sorted oldest first. Empty if
+            ``aggs`` is empty.
+        """
+        if not aggs:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(aggs)
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+
+        return df
+
+    def calculate_returns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add simple daily and compounded cumulative returns.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Chronologically sorted bars with a ``close`` column, e.g. from
+            ``create_dataframe_from_aggs``. Not mutated.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Copy of ``df`` with ``daily_return`` (close-to-close) and
+            ``cumulative_return`` (compounded from the first bar). Both
+            are NaN on the first row.
+        """
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df['daily_return'] = df['close'].pct_change()
+        df['cumulative_return'] = (1 + df['daily_return']).cumprod() - 1
+
+        return df
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Point-in-time lookup
+    # ─────────────────────────────────────────────────────────────────────────
 
     def get_price_on_date(
-        self, ticker: str, target_date: datetime, tolerance_days: int = 7
+        self,
+        ticker: str,
+        target_date: datetime,
+        tolerance_days: int = 7
     ) -> Optional[float]:
         """
         Return the close nearest to ``target_date`` for one ticker.
@@ -575,8 +731,8 @@ class MassiveAPIClient:
         try:
             data = self.fetch_stock_data(
                 ticker=ticker,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
+                start_date=start_date.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d')
             )
 
             if not data:
@@ -584,17 +740,16 @@ class MassiveAPIClient:
 
             # Bar dates are datetime.date; normalize a datetime target so
             # the subtraction below is date - date.
-            target_date_obj = (
-                target_date if hasattr(target_date, "date") else target_date
-            )
-            if hasattr(target_date_obj, "date"):
+            target_date_obj = target_date if hasattr(target_date, 'date') else target_date
+            if hasattr(target_date_obj, 'date'):
                 target_date_obj = target_date_obj.date()
 
             closest_data = min(
-                data, key=lambda x: abs((x["date"] - target_date_obj).days)
+                data,
+                key=lambda x: abs((x['date'] - target_date_obj).days)
             )
 
-            return float(closest_data["close"])
+            return float(closest_data['close'])
 
         except (ValueError, TypeError) as e:
             logger.error(f"Error getting price for {ticker} on {target_date}: {str(e)}")

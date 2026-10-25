@@ -9,7 +9,7 @@ from django.http import JsonResponse
 from django.contrib import messages
 from django.utils import timezone
 from django.conf import settings
-from snaptrade_client import SnapTrade
+from snaptrade_client import SnapTrade, SnapTradeAuth
 
 from trading.models import Stock, MomentumScore, TradingSignal, RebalanceEvent
 from trading.services.momentum_calculator import get_momentum_calculator
@@ -257,8 +257,10 @@ def initiate_snaptrade_auth(request):
     
     # Initialize SnapTrade client
     snaptrade = SnapTrade(
-        consumer_key=consumer_key,
-        client_id=client_id,
+        auth=SnapTradeAuth.commercial_api_key(
+            consumer_key=consumer_key,
+            client_id=client_id,
+        ),
     )
     
     # Generate a unique user ID for SnapTrade
@@ -333,8 +335,10 @@ def snaptrade_callback(request):
 
     # Initialize SnapTrade client
     snaptrade = SnapTrade(
-        consumer_key=settings.SNAPTRADE_CLIENT_SECRET,
-        client_id=settings.SNAPTRADE_CLIENT_ID,
+        auth=SnapTradeAuth.commercial_api_key(
+            consumer_key=settings.SNAPTRADE_CLIENT_SECRET,
+            client_id=settings.SNAPTRADE_CLIENT_ID,
+        ),
     )
     
     # Get user accounts using SDK
